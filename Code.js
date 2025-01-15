@@ -26,6 +26,7 @@ const TRIP_DURATION_HOURS = 3;
  * @constant {CityData[]} 
  */
 const CITIES = [
+  { code: "THE", name: "TERESINA - PI" },
   { code: "PHB", name: "PARNAIBA - PI" },
   { code: "PIR", name: "PIRIPIRI - PI" }
 ];
@@ -149,7 +150,6 @@ function runGuanabaraTicketScript() {
   const calendarId = ensureCalendarExists();
   const ticketsFolder = ensureTicketsFolderExists();
 
-  // Alteração aqui para buscar e-mails dos últimos 1 mês
   const threads = GmailApp.search('subject:"Expresso Guanabara - Compra confirmada com sucesso" newer_than:1m');
   console.log(`Total de threads encontradas: ${threads.length}`);
 
@@ -250,7 +250,7 @@ function runGuanabaraTicketScript() {
             fileId: driveFile.getId(),
             fileUrl,
             title: driveFile.getName()
-          };
+          }];
 
           console.log(`    PDF salvo no Drive: ${newFilename}`);
           console.log(`    PDF anexado ao evento: ${fileUrl}`);
