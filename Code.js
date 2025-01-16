@@ -5,7 +5,8 @@
  * A duração da viagem é controlada por uma variável no topo. As rotas são determinadas
  * dinamicamente a partir do array CITIES, para que o nome do anexo e a rota no corpo
  * do e-mail sejam considerados de forma coerente. Logs foram incluídos para depuração.
- * 
+ * Adiciona lembretes (alertas) ao evento conforme configurado no array ALERTS.
+ *
  * Autor: Mayllon Veras (mayllonveras@gmail.com)
  */
 
@@ -15,15 +16,15 @@
  * @property {string} name - Nome completo da cidade (ex.: "PARNAIBA - PI").
  */
 
-/** 
- * Número de horas de duração padrão para cada viagem. 
- * @constant {number} 
+/**
+ * Número de horas de duração padrão para cada viagem.
+ * @constant {number}
  */
 const TRIP_DURATION_HOURS = 3;
 
-/** 
+/**
  * Lista de cidades. Adicione/edite conforme necessário.
- * @constant {CityData[]} 
+ * @constant {CityData[]}
  */
 const CITIES = [
   { code: "THE", name: "TERESINA - PI" },
@@ -32,12 +33,45 @@ const CITIES = [
 ];
 
 /**
+ * Lista de lembretes que serão adicionados ao evento.
+ * Cada entrada representa quanto tempo antes do evento o lembrete será acionado:
+ * "30m" => 30 minutos
+ * "1h"  => 60 minutos
+ * "1.5h"=> 90 minutos
+ * @constant {string[]}
+ */
+const ALERTS = ["30m", "1h", "1.5h"];
+
+/**
  * Gera uma subexpressão de regex unindo todos os valores de nome do array CITIES.
  * @returns {string} Regex pattern para representar todas as cidades no array CITIES.
  */
 function buildCitiesRegexPart() {
-  const escapedList = CITIES.map(city => city.name.replace(/\s*-\s*/g, '\\s*\\-\\s*'));
+  const escapedList = CITIES.map(city =>
+    city.name.replace(/\s*-\s*/g, '\\s*\\-\\s*')
+  );
   return `(${escapedList.join('|')})`;
+}
+
+/**
+ * Converte um texto de alerta (ex.: "30m", "1h", "1.5h") para minutos.
+ * @param {string} alertStr - Ex.: "30m", "1h", "1.5h"
+ * @returns {number} Quantidade de minutos calculada a partir do alerta.
+ */
+function parseAlertToMinutes(alertStr) {
+  const pattern = /^(\d+(\.\d+)?)([mh])$/i; // Ex.: 30m, 1h, 1.5h
+  const match = alertStr.match(pattern);
+  if (!match) return 0;
+
+  const amount = parseFloat(match[1]);
+  const unit = match[3].toLowerCase();
+
+  if (unit === 'm') {
+    return Math.round(amount);
+  } else {
+    // 'h'
+    return Math.round(amount * 60);
+  }
 }
 
 /**
@@ -47,8 +81,7 @@ function buildCitiesRegexPart() {
 function ensureLabelExists() {
   const labelName = "Passagem Guanabara agendada";
   const label = GmailApp.getUserLabelByName(labelName);
-  if (label) return label;
-  return GmailApp.createLabel(labelName);
+  return label || GmailApp.createLabel(labelName);
 }
 
 /**
@@ -58,8 +91,7 @@ function ensureLabelExists() {
 function ensureTicketsFolderExists() {
   const folderName = "Bilhetes - passagens Guanabara";
   const folderSearch = DriveApp.getFoldersByName(folderName);
-  if (folderSearch.hasNext()) return folderSearch.next();
-  return DriveApp.createFolder(folderName);
+  return folderSearch.hasNext() ? folderSearch.next() : DriveApp.createFolder(folderName);
 }
 
 /**
@@ -144,6 +176,7 @@ function extractRouteFromFilename(filename) {
  * Cria ou identifica todos os recursos necessários e pesquisa mensagens no Gmail
  * sobre compras confirmadas da Expresso Guanabara, criando eventos no Calendar
  * e salvando PDFs no Drive. Marca as threads processadas com a label.
+ * Agora adiciona lembretes (pop-up) conforme o array ALERTS.
  */
 function runGuanabaraTicketScript() {
   const label = ensureLabelExists();
@@ -153,8 +186,8 @@ function runGuanabaraTicketScript() {
   const threads = GmailApp.search('subject:"Expresso Guanabara - Compra confirmada com sucesso" newer_than:1m');
   console.log(`Total de threads encontradas: ${threads.length}`);
 
-  const cityRegexPart = buildCitiesRegexPart();
   // Monta a regex para achar algo como "CIDADE1 <span>...</span> CIDADE2"
+  const cityRegexPart = buildCitiesRegexPart();
   const routeRegex = new RegExp(`${cityRegexPart}\\s*<span[^>]*>[^<]*<\\/span>\\s*${cityRegexPart}`, 'gi');
 
   for (let i = 0; i < threads.length; i++) {
@@ -173,11 +206,12 @@ function runGuanabaraTicketScript() {
       const msg = messages[m];
       const body = msg.getBody();
       const datesFound = body.match(/(?:[a-zçã-ú-]+,\s*)?\d{1,2}\s+de\s+[a-zçã-ú]+\s+de\s+\d{4}\s+às\s+\d{2}:\d{2}/gi) || [];
-      
+
+      // Captura todas as rotas do corpo
       let routesFound = [];
       let matchRoute;
       while ((matchRoute = routeRegex.exec(body)) !== null) {
-        if (matchRoute.length === 3) { // matchRoute[1]: origin, matchRoute[2]: destination
+        if (matchRoute.length === 3) {
           routesFound.push({
             origin: matchRoute[1].trim(),
             destination: matchRoute[2].trim()
@@ -188,12 +222,14 @@ function runGuanabaraTicketScript() {
       const limit = Math.min(datesFound.length, routesFound.length);
       console.log(`Mensagem #${m}: datas=${datesFound.length}, rotas=${routesFound.length}, limit=${limit}`);
 
+      // Lê anexos
       const attachments = msg.getAttachments({
         includeInlineImages: false,
         includeAttachments: true
       });
       console.log(`Mensagem #${m} possui ${attachments.length} anexos.`);
 
+      // Mapeia os anexos dinamicamente
       const routeMap = {};
       for (let a = 0; a < attachments.length; a++) {
         const filename = attachments[a].getName();
@@ -214,24 +250,36 @@ function runGuanabaraTicketScript() {
           console.log(`    Data inválida: ${dateStr}`);
           continue;
         }
+        // Determina o fim do evento baseado em TRIP_DURATION_HOURS
         const endDate = new Date(startDate.getTime() + TRIP_DURATION_HOURS * 60 * 60 * 1000);
 
         const route = routesFound[k];
         const origin = route.origin;
         const destination = route.destination;
-        console.log(`    Trecho #${k}: origem=${origin}, destino=${destination}`);
-
         const routeKey = `${origin}|${destination}`;
+        console.log(`    Trecho #${k}: origem=${origin}, destino=${destination}`);
         console.log(`    routeKey=${routeKey}`);
 
         const eventTitle = `Viagem ${origin.replace(/\s*-\s*PI/i, "")} : ${destination.replace(/\s*-\s*PI/i, "")}`;
 
+        // Constrói dados do evento
         const eventData = {
           summary: eventTitle,
           start: { dateTime: startDate.toISOString() },
-          end: { dateTime: endDate.toISOString() }
+          end: { dateTime: endDate.toISOString() },
+          // Adiciona lembretes personalizados com base em ALERTS
+          reminders: {
+            useDefault: false,
+            overrides: ALERTS.map(alertStr => {
+              return {
+                method: 'popup',
+                minutes: parseAlertToMinutes(alertStr)
+              };
+            })
+          }
         };
 
+        // Se houver anexo correspondente, salva e anexa
         if (routeMap[routeKey]) {
           console.log(`    Encontrado anexo para ${routeKey}`);
           const originSig = getCityCode(origin);
@@ -258,6 +306,7 @@ function runGuanabaraTicketScript() {
           console.log(`    Nenhum anexo no routeMap para ${routeKey}`);
         }
 
+        // Cria o evento no Calendar com lembretes
         Calendar.Events.insert(eventData, calendarId, { supportsAttachments: true });
         console.log(`    Evento criado: ${eventTitle}`);
         eventCreated = true;
@@ -271,4 +320,24 @@ function runGuanabaraTicketScript() {
   }
 
   console.log("Script finalizado.");
+}
+
+/**
+ * Converte o texto de alerta (ex.: "30m", "1h", "1.5h") em minutos.
+ * @param {string} alertStr - Ex.: "30m", "1h", "1.5h"
+ * @returns {number} Quantidade de minutos
+ */
+function parseAlertToMinutes(alertStr) {
+  const pattern = /^(\d+(\.\d+)?)([mh])$/i; // Ex.: 30m, 1h, 1.5h
+  const match = alertStr.match(pattern);
+  if (!match) return 0;
+
+  const amount = parseFloat(match[1]);
+  const unit = match[3].toLowerCase();
+
+  if (unit === 'm') {
+    return Math.round(amount);
+  } else { // 'h'
+    return Math.round(amount * 60);
+  }
 }
