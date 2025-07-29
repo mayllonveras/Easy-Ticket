@@ -1,31 +1,19 @@
 /**
- * @fileoverview Script do Easy Ticket que pesquisa e-mails do Gmail para compras confirmadas
- * da Expresso Guanabara, cria eventos no calendário "Viagens", salva PDFs em uma pasta
- * específica do Drive e marca as threads com a label "Passagem Guanabara agendada".
- * A duração da viagem é controlada por uma variável no topo. As rotas são determinadas
- * dinamicamente a partir do array CITIES, para que o nome do anexo e a rota no corpo
- * do e-mail sejam considerados de forma coerente. Logs foram incluídos para depuração.
- * Adiciona lembretes (alertas) ao evento conforme configurado no array ALERTS.
+ * @fileoverview Easy Ticket – lê e-mails da Expresso Guanabara, cria eventos na agenda
+ * “Viagens”, salva PDFs no Drive e rotula os e-mails processados.
  *
- * Autor: Mayllon Veras (mayllonveras@gmail.com)
- */
-
-/**
  * @typedef {Object} CityData
- * @property {string} code - Sigla da cidade (ex.: "PHB").
- * @property {string} name - Nome completo da cidade (ex.: "PARNAIBA - PI").
+ * @property {string} code   Sigla da cidade.
+ * @property {string} name   Nome completo “CIDADE - UF”.
  */
 
-/**
- * Número de horas de duração padrão para cada viagem.
- * @constant {number}
- */
+/** alertas de lembrete ― ex.: "30m", "1h", "1.5h" */
+const ALERTS = ["30m", "1h", "1.5h"];
+
+/** duração padrão do deslocamento (h) */
 const TRIP_DURATION_HOURS = 3;
 
-/**
- * Lista de cidades. Adicione/edite conforme necessário.
- * @constant {CityData[]}
- */
+/** cidades tratadas pelo script */
 const CITIES = [
   { code: "THE", name: "TERESINA - PI" },
   { code: "PHB", name: "PARNAIBA - PI" },
@@ -33,311 +21,165 @@ const CITIES = [
 ];
 
 /**
- * Lista de lembretes que serão adicionados ao evento.
- * Cada entrada representa quanto tempo antes do evento o lembrete será acionado:
- * "30m" => 30 minutos
- * "1h"  => 60 minutos
- * "1.5h"=> 90 minutos
- * @constant {string[]}
+ * @returns {string} parte regex com todas as cidades escapadas.
  */
-const ALERTS = ["30m", "1h", "1.5h"];
+function buildCitiesPart() {
+  return `(${CITIES.map(c => c.name.replace(/\s*-\s*/g, "\\s*-\\s*")).join("|")})`;
+}
 
-/**
- * Gera uma subexpressão de regex unindo todos os valores de nome do array CITIES.
- * @returns {string} Regex pattern para representar todas as cidades no array CITIES.
- */
-function buildCitiesRegexPart() {
-  const escapedList = CITIES.map(city =>
-    city.name.replace(/\s*-\s*/g, '\\s*\\-\\s*')
-  );
-  return `(${escapedList.join('|')})`;
+/** regex p/ rota (origem … destino) aceitando qualquer trecho entre elas */
+function buildRouteRegex() {
+  return new RegExp(`${buildCitiesPart()}[\\s\\S]*?${buildCitiesPart()}`, "gi");
+}
+
+/** label “Passagem Guanabara agendada” */
+function ensureLabel() {
+  const n = "Passagem Guanabara agendada";
+  return GmailApp.getUserLabelByName(n) || GmailApp.createLabel(n);
+}
+
+/** pasta “Bilhetes - passagens Guanabara” */
+function ensureFolder() {
+  const n = "Bilhetes - passagens Guanabara";
+  const f = DriveApp.getFoldersByName(n);
+  return f.hasNext() ? f.next() : DriveApp.createFolder(n);
+}
+
+/** calendário “Viagens” */
+function ensureCalendar() {
+  const n = "Viagens";
+  const c = (Calendar.CalendarList.list().items || []).find(i => i.summary === n);
+  return c ? c.id : Calendar.Calendars.insert({ summary: n }).id;
 }
 
 /**
- * Converte um texto de alerta (ex.: "30m", "1h", "1.5h") para minutos.
- * @param {string} alertStr - Ex.: "30m", "1h", "1.5h"
- * @returns {number} Quantidade de minutos calculada a partir do alerta.
+ * converte string pt-BR (“29 jul, terça 10:01” | “16 de janeiro de 2025 às 13:11”) em Date.
+ * @param {string} txt
+ * @returns {Date|null}
  */
-function parseAlertToMinutes(alertStr) {
-  const pattern = /^(\d+(\.\d+)?)([mh])$/i; // Ex.: 30m, 1h, 1.5h
-  const match = alertStr.match(pattern);
-  if (!match) return 0;
+function parseDatetime(txt) {
+  const full = /(\d{1,2})\s+de\s+([a-zçã-ú]+)\s+de\s+(\d{4})\s+às\s+(\d{1,2}):(\d{2})/i;
+  const short = /(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[^0-9]*?(\d{1,2}):(\d{2})/i;
+  const monthsFull = { janeiro:0, fevereiro:1, março:2, abril:3, maio:4, junho:5,
+                       julho:6, agosto:7, setembro:8, outubro:9, novembro:10, dezembro:11 };
+  const monthsShort= { jan:0, fev:1, mar:2, abr:3, mai:4, jun:5,
+                       jul:6, ago:7, set:8, out:9, nov:10, dez:11 };
 
-  const amount = parseFloat(match[1]);
-  const unit = match[3].toLowerCase();
-
-  if (unit === 'm') {
-    return Math.round(amount);
-  } else {
-    // 'h'
-    return Math.round(amount * 60);
+  let m = txt.match(full);
+  if (m) return new Date(+m[3], monthsFull[m[2].toLowerCase()], +m[1], +m[4], +m[5]);
+  m = txt.match(short);
+  if (m) {
+    const year = new Date().getFullYear();
+    return new Date(year, monthsShort[m[2].toLowerCase()], +m[1], +m[3], +m[4]);
   }
+  return null;
 }
 
-/**
- * Cria ou recupera a label "Passagem Guanabara agendada" no Gmail.
- * @returns {GoogleAppsScript.Gmail.GmailLabel} A label de agendamento.
- */
-function ensureLabelExists() {
-  const labelName = "Passagem Guanabara agendada";
-  const label = GmailApp.getUserLabelByName(labelName);
-  return label || GmailApp.createLabel(labelName);
+/** map sigla ←→ nome completo */
+function getCityCode(name) {
+  const c = CITIES.find(c => name.includes(c.name));
+  return c ? c.code : "???";
 }
 
-/**
- * Cria ou recupera a pasta "Bilhetes - passagens Guanabara" no Drive.
- * @returns {GoogleAppsScript.Drive.Folder} A pasta para armazenar PDFs.
- */
-function ensureTicketsFolderExists() {
-  const folderName = "Bilhetes - passagens Guanabara";
-  const folderSearch = DriveApp.getFoldersByName(folderName);
-  return folderSearch.hasNext() ? folderSearch.next() : DriveApp.createFolder(folderName);
-}
-
-/**
- * Cria ou recupera o calendário "Viagens" usando o serviço avançado do Calendar.
- * @returns {string} O ID do calendário.
- */
-function ensureCalendarExists() {
-  const summaryName = "Viagens";
-  const calList = Calendar.CalendarList.list().items || [];
-  let calendarId = null;
-  for (let i = 0; i < calList.length; i++) {
-    if (calList[i].summary === summaryName) {
-      calendarId = calList[i].id;
-      break;
-    }
-  }
-  if (!calendarId) {
-    const newCal = Calendar.Calendars.insert({ summary: summaryName });
-    calendarId = newCal.id;
-  }
-  return calendarId;
-}
-
-/**
- * Converte uma string em português com data e hora (ex.: "16 de janeiro de 2025 às 13:11")
- * em um objeto Date do JavaScript.
- * @param {string} ptBrDatetimeString - A string de data/hora em português.
- * @returns {Date|null} O objeto Date convertido ou null se falhar.
- */
-function parseDatetimePtBr(ptBrDatetimeString) {
-  const monthsMap = {
-    janeiro: 0, fevereiro: 1, março: 2, abril: 3, maio: 4, junho: 5,
-    julho: 6, agosto: 7, setembro: 8, outubro: 9, novembro: 10, dezembro: 11
-  };
-  const regex = /(?:[a-zçã-ú-]+,\s*)?(\d{1,2})\s+de\s+([a-zçã-ú]+)\s+de\s+(\d{4})\s+às\s+(\d{1,2}):(\d{2})/i;
-  const match = ptBrDatetimeString.match(regex);
-  if (!match) return null;
-  const day = parseInt(match[1], 10);
-  const month = monthsMap[match[2].toLowerCase()];
-  const year = parseInt(match[3], 10);
-  const hour = parseInt(match[4], 10);
-  const minute = parseInt(match[5], 10);
-  return new Date(year, month, day, hour, minute);
-}
-
-/**
- * Retorna a sigla de uma cidade com base no array CITIES.
- * @param {string} cityText - Texto contendo cidade e estado (ex.: "PARNAIBA - PI").
- * @returns {string} Sigla correspondente ou "???" se não encontrada.
- */
-function getCityCode(cityText) {
-  for (let i = 0; i < CITIES.length; i++) {
-    if (cityText.includes(CITIES[i].name)) {
-      return CITIES[i].code;
-    }
-  }
-  return "???";
-}
-
-/**
- * Extrai a rota (origem e destino) do nome do arquivo do anexo com base nas cidades definidas.
- * @param {string} filename - Nome do arquivo do anexo.
- * @returns {Object|null} Objeto contendo origin e destination ou null se não encontrado.
- */
-function extractRouteFromFilename(filename) {
-  for (let i = 0; i < CITIES.length; i++) {
-    for (let j = 0; j < CITIES.length; j++) {
-      if (i === j) continue; // Ignorar rota de uma cidade para ela mesma
-      const origin = CITIES[i].name;
-      const destination = CITIES[j].name;
-      const expectedPattern = `${origin.replace(/\s*-\s*/g, '\\s*\\-\\s*')}\\s*\\-\\s*${destination.replace(/\s*-\s*/g, '\\s*\\-\\s*')}`;
-      const regex = new RegExp(expectedPattern, 'i');
-      if (regex.test(filename)) {
-        return { origin, destination };
-      }
+/** extrai rota do nome do anexo */
+function routeFromFilename(name) {
+  for (const o of CITIES) {
+    for (const d of CITIES) {
+      if (o === d) continue;
+      const p = `${o.name.replace(/\s*[-–—]\s*/g, "\\s*-\\s*")}\\s*-\\s*${d.name.replace(/\s*[-–—]\s*/g, "\\s*-\\s*")}`;
+      if (new RegExp(p, "i").test(name)) return { origin:o.name, destination:d.name };
     }
   }
   return null;
 }
 
-/**
- * Cria ou identifica todos os recursos necessários e pesquisa mensagens no Gmail
- * sobre compras confirmadas da Expresso Guanabara, criando eventos no Calendar
- * e salvando PDFs no Drive. Marca as threads processadas com a label.
- * Agora adiciona lembretes (pop-up) conforme o array ALERTS.
- */
-function runGuanabaraTicketScript() {
-  const label = ensureLabelExists();
-  const calendarId = ensureCalendarExists();
-  const ticketsFolder = ensureTicketsFolderExists();
-
-  const threads = GmailApp.search('subject:"Expresso Guanabara - Compra confirmada com sucesso" newer_than:1m');
-  console.log(`Total de threads encontradas: ${threads.length}`);
-
-  // Monta a regex para achar algo como "CIDADE1 <span>...</span> CIDADE2"
-  const cityRegexPart = buildCitiesRegexPart();
-  const routeRegex = new RegExp(`${cityRegexPart}\\s*<span[^>]*>[^<]*<\\/span>\\s*${cityRegexPart}`, 'gi');
-
-  for (let i = 0; i < threads.length; i++) {
-    const thread = threads[i];
-    const hasLabel = thread.getLabels().some(lbl => lbl.getName() === label.getName());
-    if (hasLabel) {
-      console.log(`Thread #${i} já tem label, pulando...`);
-      continue;
-    }
-
-    let eventCreated = false;
-    const messages = thread.getMessages();
-    console.log(`Thread #${i} com ${messages.length} mensagens.`);
-
-    for (let m = 0; m < messages.length; m++) {
-      const msg = messages[m];
-      const body = msg.getBody();
-      const datesFound = body.match(/(?:[a-zçã-ú-]+,\s*)?\d{1,2}\s+de\s+[a-zçã-ú]+\s+de\s+\d{4}\s+às\s+\d{2}:\d{2}/gi) || [];
-
-      // Captura todas as rotas do corpo
-      let routesFound = [];
-      let matchRoute;
-      while ((matchRoute = routeRegex.exec(body)) !== null) {
-        if (matchRoute.length === 3) {
-          routesFound.push({
-            origin: matchRoute[1].trim(),
-            destination: matchRoute[2].trim()
-          });
-        }
-      }
-
-      const limit = Math.min(datesFound.length, routesFound.length);
-      console.log(`Mensagem #${m}: datas=${datesFound.length}, rotas=${routesFound.length}, limit=${limit}`);
-
-      // Lê anexos
-      const attachments = msg.getAttachments({
-        includeInlineImages: false,
-        includeAttachments: true
-      });
-      console.log(`Mensagem #${m} possui ${attachments.length} anexos.`);
-
-      // Mapeia os anexos dinamicamente
-      const routeMap = {};
-      for (let a = 0; a < attachments.length; a++) {
-        const filename = attachments[a].getName();
-        console.log(`  Anexo #${a}: ${filename}`);
-
-        const route = extractRouteFromFilename(filename);
-        if (route) {
-          const routeKey = `${route.origin}|${route.destination}`;
-          routeMap[routeKey] = attachments[a];
-          console.log(`    Mapeado routeMap[${routeKey}]`);
-        }
-      }
-
-      for (let k = 0; k < limit; k++) {
-        const dateStr = datesFound[k];
-        const startDate = parseDatetimePtBr(dateStr);
-        if (!startDate) {
-          console.log(`    Data inválida: ${dateStr}`);
-          continue;
-        }
-        // Determina o fim do evento baseado em TRIP_DURATION_HOURS
-        const endDate = new Date(startDate.getTime() + TRIP_DURATION_HOURS * 60 * 60 * 1000);
-
-        const route = routesFound[k];
-        const origin = route.origin;
-        const destination = route.destination;
-        const routeKey = `${origin}|${destination}`;
-        console.log(`    Trecho #${k}: origem=${origin}, destino=${destination}`);
-        console.log(`    routeKey=${routeKey}`);
-
-        const eventTitle = `Viagem ${origin.replace(/\s*-\s*PI/i, "")} : ${destination.replace(/\s*-\s*PI/i, "")}`;
-
-        // Constrói dados do evento
-        const eventData = {
-          summary: eventTitle,
-          start: { dateTime: startDate.toISOString() },
-          end: { dateTime: endDate.toISOString() },
-          // Adiciona lembretes personalizados com base em ALERTS
-          reminders: {
-            useDefault: false,
-            overrides: ALERTS.map(alertStr => {
-              return {
-                method: 'popup',
-                minutes: parseAlertToMinutes(alertStr)
-              };
-            })
-          }
-        };
-
-        // Se houver anexo correspondente, salva e anexa
-        if (routeMap[routeKey]) {
-          console.log(`    Encontrado anexo para ${routeKey}`);
-          const originSig = getCityCode(origin);
-          const destinationSig = getCityCode(destination);
-          const formattedDate = Utilities.formatDate(startDate, Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
-
-          const pdfBlob = routeMap[routeKey].copyBlob();
-          const newFilename = `Bilhete Guanabara ${originSig}>${destinationSig}-${formattedDate}.pdf`;
-          pdfBlob.setName(newFilename);
-
-          const driveFile = ticketsFolder.createFile(pdfBlob);
-          driveFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-          const fileUrl = `https://drive.google.com/file/d/${driveFile.getId()}/view?usp=sharing`;
-
-          eventData.attachments = [{
-            fileId: driveFile.getId(),
-            fileUrl,
-            title: driveFile.getName()
-          }];
-
-          console.log(`    PDF salvo no Drive: ${newFilename}`);
-          console.log(`    PDF anexado ao evento: ${fileUrl}`);
-        } else {
-          console.log(`    Nenhum anexo no routeMap para ${routeKey}`);
-        }
-
-        // Cria o evento no Calendar com lembretes
-        Calendar.Events.insert(eventData, calendarId, { supportsAttachments: true });
-        console.log(`    Evento criado: ${eventTitle}`);
-        eventCreated = true;
-      }
-    }
-
-    if (eventCreated) {
-      console.log(`Adicionando label na thread #${i}`);
-      thread.addLabel(label);
-    }
-  }
-
-  console.log("Script finalizado.");
+/** “30m” → 30; “1.5h” → 90 */
+function alertToMinutes(s) {
+  return s.endsWith("m") ? Math.round(parseFloat(s))
+       : s.endsWith("h") ? Math.round(parseFloat(s) * 60)
+       : 0;
 }
 
-/**
- * Converte o texto de alerta (ex.: "30m", "1h", "1.5h") em minutos.
- * @param {string} alertStr - Ex.: "30m", "1h", "1.5h"
- * @returns {number} Quantidade de minutos
- */
-function parseAlertToMinutes(alertStr) {
-  const pattern = /^(\d+(\.\d+)?)([mh])$/i; // Ex.: 30m, 1h, 1.5h
-  const match = alertStr.match(pattern);
-  if (!match) return 0;
+function runGuanabaraTicketScript() {
+  const lbl     = ensureLabel();
+  const calId   = ensureCalendar();
+  const folder  = ensureFolder();
+  const routeRe = buildRouteRegex();
+  const threads = GmailApp.search('subject:"Expresso Guanabara - Compra confirmada com sucesso" newer_than:1m');
 
-  const amount = parseFloat(match[1]);
-  const unit = match[3].toLowerCase();
+  console.log(`Total de threads encontradas: ${threads.length}`);
 
-  if (unit === 'm') {
-    return Math.round(amount);
-  } else { // 'h'
-    return Math.round(amount * 60);
-  }
+  threads.forEach((th, ti) => {
+    if (th.getLabels().some(l => l.getName() === lbl.getName())) {
+      console.log(`Thread #${ti} já tem label, pulando...`);
+      return;
+    }
+
+    console.log(`Thread #${ti} com ${th.getMessageCount()} mensagens.`);
+    let created = false;
+
+    th.getMessages().forEach((msg, mi) => {
+      const body = msg.getBody();
+      const dateMatches = body.match(/(?:\d{1,2}\s+de\s+[a-zçã-ú]+\s+de\s+\d{4}\s+às\s+\d{2}:\d{2})|(?:\d{1,2}\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[^0-9]{1,15}\d{2}:\d{2})/gi) || [];
+
+      const routes = [];
+      let m; routeRe.lastIndex = 0;
+      while ((m = routeRe.exec(body)) !== null) routes.push({ origin:m[1].trim(), destination:m[2].trim() });
+
+      console.log(`Mensagem #${mi}: datas=${dateMatches.length}, rotas=${routes.length}`);
+
+      const routeMap = {};
+      msg.getAttachments({ includeAttachments:true }).forEach((at,i) => {
+        const r = routeFromFilename(at.getName());
+        console.log(`  Anexo #${i}: ${at.getName()}`);
+        if (r) {
+          routeMap[`${r.origin}|${r.destination}`] = at;
+          console.log(`    Mapeado routeMap[${r.origin}|${r.destination}]`);
+        }
+      });
+
+      const limit = Math.min(dateMatches.length, routes.length);
+      for (let i = 0; i < limit; i++) {
+        const start = parseDatetime(dateMatches[i]);
+        if (!start) continue;
+        const end   = new Date(start.getTime() + TRIP_DURATION_HOURS * 3600000);
+        const { origin, destination } = routes[i];
+        const key   = `${origin}|${destination}`;
+
+        console.log(`    Evento #${i}: ${origin} ➜ ${destination}`);
+
+        const overrides = ALERTS.map(a => ({ method:"popup", minutes:alertToMinutes(a) })).filter(o => o.minutes);
+
+        const ev = {
+          summary: `Viagem ${origin.replace(/\s*-\s*PI/i,"")} : ${destination.replace(/\s*-\s*PI/i,"")}`,
+          start:   { dateTime:start.toISOString() },
+          end:     { dateTime:end.toISOString() },
+          reminders:{ useDefault:false, overrides }
+        };
+
+        if (routeMap[key]) {
+          const sigO = getCityCode(origin), sigD = getCityCode(destination);
+          const tag  = Utilities.formatDate(start, Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
+          const blob = routeMap[key].copyBlob().setName(`Bilhete Guanabara ${sigO}>${sigD}-${tag}.pdf`);
+          const file = folder.createFile(blob).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+          ev.attachments = [{
+            fileId: file.getId(),
+            fileUrl:`https://drive.google.com/file/d/${file.getId()}/view?usp=sharing`,
+            title: file.getName()
+          }];
+        }
+
+        Calendar.Events.insert(ev, calId, { supportsAttachments:true });
+        created = true;
+        console.log("      ✓ evento criado");
+      }
+    });
+
+    if (created) {
+      th.addLabel(lbl);
+      console.log(`Label aplicada na thread #${ti}`);
+    }
+  });
+
+  console.log("Script finalizado.");
 }
