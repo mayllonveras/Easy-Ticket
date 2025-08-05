@@ -1,11 +1,13 @@
 /**
- * @fileoverview Easy Ticket – lê e-mails da Expresso Guanabara, cria eventos na agenda
- * “Viagens”, salva PDFs no Drive e rotula os e-mails processados.
+ * @fileoverview Easy Ticket – lê e-mails da Expresso Guanabara, cria eventos
+ * na agenda “Viagens”, salva PDFs no Drive e rotula os e-mails processados.
  *
  * @typedef {Object} CityData
  * @property {string} code   Sigla da cidade.
  * @property {string} name   Nome completo “CIDADE - UF”.
  */
+
+/* -------------------- CONFIG -------------------- */
 
 /** alertas de lembrete ― ex.: "30m", "1h", "1.5h" */
 const ALERTS = ["30m", "1h", "1.5h"];
@@ -20,16 +22,19 @@ const CITIES = [
   { code: "PIR", name: "PIRIPIRI - PI" }
 ];
 
-/**
- * @returns {string} parte regex com todas as cidades escapadas.
- */
+/* -------------------- FUNÇÕES AUXILIARES -------------------- */
+
+/** parte regex com todas as cidades escapadas. */
 function buildCitiesPart() {
   return `(${CITIES.map(c => c.name.replace(/\s*-\s*/g, "\\s*-\\s*")).join("|")})`;
 }
 
-/** regex p/ rota (origem … destino) aceitando qualquer trecho entre elas */
+/** regex p/ rota (origem … destino) dentro dos blocos “Viagem de Ida/Volta” */
 function buildRouteRegex() {
-  return new RegExp(`${buildCitiesPart()}[\\s\\S]*?${buildCitiesPart()}`, "gi");
+  const cities = buildCitiesPart();                         // (CIDADE - UF|CIDADE - UF|…)
+  // Procura “Viagem de Ida” OU “Viagem de Volta”, depois a primeira cidade
+  // e, mais adiante no mesmo bloco, a segunda cidade (pode haver HTML entre elas).
+  return new RegExp(`Viagem\\s+de\\s+(?:Ida|Volta)[\\s\\S]*?${cities}[\\s\\S]*?${cities}`, "gi");
 }
 
 /** label “Passagem Guanabara agendada” */
@@ -58,7 +63,7 @@ function ensureCalendar() {
  * @returns {Date|null}
  */
 function parseDatetime(txt) {
-  const full = /(\d{1,2})\s+de\s+([a-zçã-ú]+)\s+de\s+(\d{4})\s+às\s+(\d{1,2}):(\d{2})/i;
+  const full  = /(\d{1,2})\s+de\s+([a-zçã-ú]+)\s+de\s+(\d{4})\s+às\s+(\d{1,2}):(\d{2})/i;
   const short = /(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[^0-9]*?(\d{1,2}):(\d{2})/i;
   const monthsFull = { janeiro:0, fevereiro:1, março:2, abril:3, maio:4, junho:5,
                        julho:6, agosto:7, setembro:8, outubro:9, novembro:10, dezembro:11 };
@@ -100,6 +105,19 @@ function alertToMinutes(s) {
        : 0;
 }
 
+/* -------------------- NOVA FUNÇÃO -------------------- */
+
+/** normaliza nomes de cidade para comparação (maiúsculas, hífens, espaços) */
+function normalizeCity(txt) {
+  return txt
+    .replace(/\s*[-–—]\s*/g, " - ") // hífens ou travessões → espaço-hífen-espaço
+    .replace(/\s+/g, " ")           // reduz espaços múltiplos
+    .trim()
+    .toUpperCase();
+}
+
+/* -------------------- SCRIPT PRINCIPAL -------------------- */
+
 function runGuanabaraTicketScript() {
   const lbl     = ensureLabel();
   const calId   = ensureCalendar();
@@ -120,21 +138,28 @@ function runGuanabaraTicketScript() {
 
     th.getMessages().forEach((msg, mi) => {
       const body = msg.getBody();
-      const dateMatches = body.match(/(?:\d{1,2}\s+de\s+[a-zçã-ú]+\s+de\s+\d{4}\s+às\s+\d{2}:\d{2})|(?:\d{1,2}\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[^0-9]{1,15}\d{2}:\d{2})/gi) || [];
 
+      // --- Datas ---
+      const dateMatches =
+        body.match(/(?:\d{1,2}\s+de\s+[a-zçã-ú]+\s+de\s+\d{4}\s+às\s+\d{2}:\d{2})|(?:\d{1,2}\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[^0-9]{1,15}\d{2}:\d{2})/gi) || [];
+
+      // --- Rotas ---
       const routes = [];
       let m; routeRe.lastIndex = 0;
-      while ((m = routeRe.exec(body)) !== null) routes.push({ origin:m[1].trim(), destination:m[2].trim() });
+      while ((m = routeRe.exec(body)) !== null)
+        routes.push({ origin: m[1].trim(), destination: m[2].trim() });
 
       console.log(`Mensagem #${mi}: datas=${dateMatches.length}, rotas=${routes.length}`);
 
+      // --- Anexos mapeados ---
       const routeMap = {};
       msg.getAttachments({ includeAttachments:true }).forEach((at,i) => {
         const r = routeFromFilename(at.getName());
         console.log(`  Anexo #${i}: ${at.getName()}`);
         if (r) {
-          routeMap[`${r.origin}|${r.destination}`] = at;
-          console.log(`    Mapeado routeMap[${r.origin}|${r.destination}]`);
+          const key = `${normalizeCity(r.origin)}|${normalizeCity(r.destination)}`;
+          routeMap[key] = at;
+          console.log(`    Mapeado routeMap[${key}]`);
         }
       });
 
@@ -142,26 +167,48 @@ function runGuanabaraTicketScript() {
       for (let i = 0; i < limit; i++) {
         const start = parseDatetime(dateMatches[i]);
         if (!start) continue;
-        const end   = new Date(start.getTime() + TRIP_DURATION_HOURS * 3600000);
-        const { origin, destination } = routes[i];
-        const key   = `${origin}|${destination}`;
+
+        let origin      = routes[i].origin;
+        let destination = routes[i].destination;
+
+        // procura anexo correspondente
+        const key        = `${normalizeCity(origin)}|${normalizeCity(destination)}`;
+        const swappedKey = `${normalizeCity(destination)}|${normalizeCity(origin)}`;
+
+        let attachment = routeMap[key];
+
+        // fallback: se rota no corpo veio invertida
+        if (!attachment && routeMap[swappedKey]) {
+          attachment  = routeMap[swappedKey];
+          origin      = routes[i].destination;
+          destination = routes[i].origin;
+          console.log(`    ⚠️  Rota invertida detectada, usando ${origin} ➜ ${destination}`);
+        }
+
+        const end = new Date(start.getTime() + TRIP_DURATION_HOURS * 3600000);
 
         console.log(`    Evento #${i}: ${origin} ➜ ${destination}`);
 
-        const overrides = ALERTS.map(a => ({ method:"popup", minutes:alertToMinutes(a) })).filter(o => o.minutes);
+        // lembretes
+        const overrides = ALERTS.map(a => ({ method:"popup", minutes:alertToMinutes(a) }))
+                                .filter(o => o.minutes);
 
         const ev = {
           summary: `Viagem ${origin.replace(/\s*-\s*PI/i,"")} : ${destination.replace(/\s*-\s*PI/i,"")}`,
-          start:   { dateTime:start.toISOString() },
-          end:     { dateTime:end.toISOString() },
+          start:   { dateTime: start.toISOString() },
+          end:     { dateTime: end.toISOString() },
           reminders:{ useDefault:false, overrides }
         };
 
-        if (routeMap[key]) {
+        // anexo do bilhete
+        if (attachment) {
           const sigO = getCityCode(origin), sigD = getCityCode(destination);
           const tag  = Utilities.formatDate(start, Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
-          const blob = routeMap[key].copyBlob().setName(`Bilhete Guanabara ${sigO}>${sigD}-${tag}.pdf`);
-          const file = folder.createFile(blob).setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+          const blob = attachment.copyBlob().setName(`Bilhete Guanabara ${sigO}>${sigD}-${tag}.pdf`);
+          const file = folder.createFile(blob).setSharing(
+            DriveApp.Access.ANYONE_WITH_LINK,
+            DriveApp.Permission.VIEW
+          );
           ev.attachments = [{
             fileId: file.getId(),
             fileUrl:`https://drive.google.com/file/d/${file.getId()}/view?usp=sharing`,
